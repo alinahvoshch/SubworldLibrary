@@ -14,7 +14,7 @@ Subworld Library's purpose is to unify mods and ensure compatibility between the
 
 **Please consider contributing before forking!**
 
-Using the code for purposes other than making a dimension API is allowed unconditionally!
+For purposes other than making a dimension API, the code is licensed under [GPL3.](https://www.gnu.org/licenses/gpl-3.0.en.html)
 
 ## HOW IT WORKS
 Subworld Library does a LOT of code injection, as Terraria was not made with subworlds in mind.
