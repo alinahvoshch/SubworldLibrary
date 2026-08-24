@@ -7,40 +7,50 @@ using Terraria.ModLoader.IO;
 
 namespace SubworldLibrary
 {
-	internal class SubserverLink
+	internal class SubserverLink : IDisposable
 	{
+		private int subworld;
 		private NamedPipeServerStream pipeOut;
 		private NamedPipeServerStream pipeIn;
 
 		private bool _connected;
+		private bool _disposed;
 		private byte[] queue;
 		private int totalData;
 
-		public SubserverLink(string name, TagCompound data)
+		public SubserverLink(int id)
 		{
-			using MemoryStream stream = new MemoryStream(131070);
-
-			pipeOut = new NamedPipeServerStream(name + ".OUT", PipeDirection.In);
-			pipeIn = new NamedPipeServerStream(name + ".IN", PipeDirection.Out);
-
-			TagIO.ToStream(data, stream);
-			queue = stream.GetBuffer();
-			totalData = (int)stream.Length;
+			subworld = -1;
+			pipeOut = new NamedPipeServerStream("SubserverOUT_" + id, PipeDirection.In);
+			pipeIn = new NamedPipeServerStream("SubserverIN_" + id, PipeDirection.Out);
 		}
 
-		public bool Connected => _connected;
+		public bool Connected => _connected && !_disposed;
+		public bool Disposed => _disposed;
 
-		public void Close()
+		public void Dispose()
 		{
+			_disposed = true;
 			_connected = false;
+			subworld = -1;
 
 			pipeOut.Close();
 			pipeIn.Close();
 		}
 
+		public void Close()
+		{
+			if (subworld < 0)
+			{
+				Dispose();
+				return;
+			}
+			SubworldSystem.StopSubserver(subworld);
+		}
+
 		public void Send(byte[] data)
 		{
-			if (!_connected)
+			if (!_connected || _disposed)
 			{
 				return;
 			}
@@ -59,7 +69,7 @@ namespace SubworldLibrary
 
 		public void Send(byte[] data, int offset, int length, byte client)
 		{
-			if (!_connected)
+			if (!_connected || _disposed)
 			{
 				return;
 			}
@@ -77,31 +87,61 @@ namespace SubworldLibrary
 			}
 		}
 
-		public void ConnectAndSend(object id)
+		public void Connect(int id, TagCompound data)
+		{
+			subworld = id;
+
+			using MemoryStream stream = new MemoryStream(131070);
+			TagIO.ToStream(data, stream);
+			queue = stream.GetBuffer();
+			totalData = (int)stream.Length;
+			
+			new Thread(ConnectAndRead)
+			{
+				Name = "Subserver Packets",
+				IsBackground = true
+			}.Start();
+
+			new Thread(ConnectAndSend)
+			{
+				Name = "Subserver Relay",
+				IsBackground = true
+			}.Start();
+		}
+
+		public void ConnectAndSend()
 		{
 			try
 			{
-				SendLoop((int)id);
+				SendLoop();
+			}
+			catch
+			{
+
 			}
 			finally
 			{
-				SubworldSystem.StopSubserver((int)id);
+				Close();
 			}
 		}
 
-		public void ConnectAndRead(object id)
+		public void ConnectAndRead()
 		{
 			try
 			{
-				ReadLoop((int)id);
+				ReadLoop();
+			}
+			catch
+			{
+
 			}
 			finally
 			{
-				SubworldSystem.StopSubserver((int)id);
+				Close();
 			}
 		}
 
-		private void ReadLoop(int id)
+		private void ReadLoop()
 		{
 			pipeOut.WaitForConnection();
 
@@ -111,9 +151,9 @@ namespace SubworldLibrary
 			// prompt clients to connect to the subserver
 			for (int i = 0; i < 256; i++)
 			{
-				if (Netplay.Clients[i].IsConnected() && SubworldSystem.playerLocations[i] == id)
+				if (Netplay.Clients[i].IsConnected() && SubworldSystem.playerLocations[i] == subworld)
 				{
-					Netplay.Clients[i].Socket.AsyncSend(new byte[] { 5, 0, 3, (byte)i, 0 }, 0, 5, (state) => { });
+					Netplay.Clients[i].Socket.AsyncSend(new byte[] { 5, 0, 3, (byte)i, 0 }, 0, 5, SubworldSystem.NoOp, SubworldSystem.deniedSockets);
 				}
 			}
 
@@ -154,14 +194,14 @@ namespace SubworldLibrary
 				}
 
 				// prevents a race condition where a subserver tries to send packets to a client who just left
-				if (SubworldSystem.playerLocations[packetInfo[0]] == id)
+				if (SubworldSystem.playerLocations[packetInfo[0]] == subworld)
 				{
-					Netplay.Clients[packetInfo[0]].Socket.AsyncSend(data, 0, length, (state) => { });
+					Netplay.Clients[packetInfo[0]].Socket.AsyncSend(data, 0, length, SubworldSystem.NoOp, SubworldSystem.deniedSockets);
 				}
 			}
 		}
 
-		private void SendLoop(int id)
+		private void SendLoop()
 		{
 			pipeIn.WaitForConnection();
 

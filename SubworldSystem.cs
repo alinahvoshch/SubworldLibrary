@@ -8,6 +8,7 @@ using System.Net;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using Steamworks;
 using Terraria;
 using Terraria.Audio;
 using Terraria.Chat;
@@ -23,6 +24,7 @@ using Terraria.ModLoader.IO;
 using Terraria.Net;
 using Terraria.Net.Sockets;
 using Terraria.Social;
+using Terraria.Social.Steam;
 using Terraria.Utilities;
 using Terraria.WorldBuilding;
 
@@ -82,6 +84,10 @@ namespace SubworldLibrary
 		internal static int[] pendingMoves;
 		internal static HashSet<ISocket> deniedSockets;
 
+		private static AppId_t appIDForWorkshop;
+		private static Queue<SubserverLink> preloadedSubservers;
+		private static int nextLink;
+
 		internal static NamedPipeClientStream pipeIn;
 		internal static NamedPipeClientStream pipeOut;
 		internal static byte[] queue;
@@ -91,13 +97,20 @@ namespace SubworldLibrary
 		{
 			subworlds = new List<Subworld>();
 
-			playerLocations = new int[256];
-			Array.Fill(playerLocations, -1);
+			if (Main.dedServ && !Program.LaunchParameters.ContainsKey("-subworld"))
+			{
+				appIDForWorkshop = new AppId_t(1281930u); // hopefully this doesn't inexplicably change!
 
-			pendingMoves = new int[256];
-			Array.Fill(pendingMoves, -1);
+				playerLocations = new int[256];
+				Array.Fill(playerLocations, -1);
 
-			deniedSockets = new HashSet<ISocket>();
+				pendingMoves = new int[256];
+				Array.Fill(pendingMoves, -1);
+
+				deniedSockets = new HashSet<ISocket>(2);
+
+				preloadedSubservers = new Queue<SubserverLink>(1);
+			}
 
 			WorldFile.OnWorldLoad += ReadCachedData;
 			Player.Hooks.OnEnterWorld += OnEnterWorld;
@@ -106,11 +119,28 @@ namespace SubworldLibrary
 			suppressAutoShutdown = -1;
 		}
 
-		public override void Unload()
+		public override void OnModUnload()
 		{
 			WorldFile.OnWorldLoad -= ReadCachedData;
 			Player.Hooks.OnEnterWorld -= OnEnterWorld;
 			Netplay.OnDisconnect -= OnDisconnect;
+		}
+
+		public override void PostSetupContent()
+		{
+			// preload as soon as possible for host & play and dedicated servers with the -world parameter
+			if (ModContent.GetInstance<Config>().PreloadSubservers && Main.worldPathName != null)
+			{
+				PreloadSubserver();
+			}
+		}
+
+		public override void OnWorldLoad()
+		{
+			if (ModContent.GetInstance<Config>().PreloadSubservers && preloadedSubservers != null && preloadedSubservers.Count < 1)
+			{
+				PreloadSubserver();
+			}
 		}
 
 		private static void ReadCachedData()
@@ -315,6 +345,11 @@ namespace SubworldLibrary
 						return;
 					}
 
+					if (playerLocations[player] == i)
+					{
+						return;
+					}
+
 					MovePlayerToSubserver(player, (ushort)i);
 					return;
 				}
@@ -373,22 +408,34 @@ namespace SubworldLibrary
 				return;
 			}
 
+			int location = playerLocations[player];
+			if (id == ushort.MaxValue)
+			{
+				if (location < 0)
+				{
+					return;
+				}
+			}
+			else if (location == id)
+			{
+				return;
+			}
+
 			pendingMoves[player] = id;
 
-			ModPacket packet = ModContent.GetInstance<SubworldLibrary>().GetPacket();
-			packet.Write(id);
-			packet.Send(player);
+			byte[] packet = GetMovePacket(id);
+			Netplay.Clients[player].Socket.AsyncSend(packet, 0, packet.Length, NoOp, deniedSockets);
 
-			if (playerLocations[player] >= 0)
+			if (location >= 0)
 			{
-				subworlds[playerLocations[player]].link?.Send(GetDisconnectPacket(player, ModContent.GetInstance<SubworldLibrary>().NetID));
+				subworlds[location].link?.Send(GetDisconnectPacket(player, ModContent.GetInstance<SubworldLibrary>().NetID));
 			}
+
+			Main.player[player].active = false;
 
 			if (id != ushort.MaxValue)
 			{
 				// this respects the vanilla call order
-
-				Main.player[player].active = false;
 				NetMessage.SendData(14, -1, player, null, player, 0);
 				ChatHelper.BroadcastChatMessage(NetworkText.FromKey("Mods.SubworldLibrary.Move", Netplay.Clients[player].Name, subworlds[id].DisplayName), new Color(255, 240, 20), player);
 				Player.Hooks.PlayerDisconnect(player);
@@ -403,10 +450,24 @@ namespace SubworldLibrary
 			}
 		}
 
+		private static byte[] GetMovePacket(int id)
+		{
+			// client, (ushort) size, packet id, (byte/ushort) sublib net id, (ushort) subworld id
+			int mod = ModContent.GetInstance<SubworldLibrary>().NetID;
+			if (ModNet.NetModCount < 256)
+			{
+				return new byte[] { 6, 0, 250, (byte)mod, (byte)id, (byte)(id >> 8) };
+			}
+			return new byte[] { 7, 0, 250, (byte)mod, (byte)(mod >> 8), (byte)id, (byte)(id >> 8) };
+		}
+
 		internal static void FinishMove(int player)
 		{
 			// send packets to the client again
 			NetMessage.buffer[player].broadcast = true;
+
+			// deactivate the player again, in case a packet that reactivated them snuck through
+			Main.player[player].active = false;
 
 			RemoteClient client = Netplay.Clients[player];
 
@@ -427,22 +488,22 @@ namespace SubworldLibrary
 				client.ResetSections();
 
 				// prompt the client to reconnect
-				client.Socket.AsyncSend(new byte[] { 5, 0, 3, (byte)player, 0 }, 0, 5, (state) => { });
+				client.Socket.AsyncSend(new byte[] { 5, 0, 3, (byte)player, 0 }, 0, 5, NoOp, deniedSockets);
 
 				pendingMoves[player] = -1;
 				return;
 			}
 
-			// prompt the client to reconnect, done before setting their location so the packet can go through
-			SubserverLink link = subworlds[id].link;
-			if (link != null && link.Connected)
-			{
-				client.Socket.AsyncSend(new byte[] { 5, 0, 3, (byte)player, 0 }, 0, 5, (state) => { });
-			}
-
 			// set the client's location. DenyRead and DenySend are now in effect
 			playerLocations[player] = id;
 			deniedSockets.Add(client.Socket);
+
+			// prompt the client to reconnect, the packet is permitted to send
+			SubserverLink link = subworlds[id].link;
+			if (link != null && link.Connected)
+			{
+				client.Socket.AsyncSend(new byte[] { 5, 0, 3, (byte)player, 0 }, 0, 5, NoOp, deniedSockets);
+			}
 
 			pendingMoves[player] = -1;
 		}
@@ -466,10 +527,7 @@ namespace SubworldLibrary
 			{
 				return new byte[] { (byte)player, 5, 0, 250, (byte)id, (byte)id };
 			}
-			else
-			{
-				return new byte[] { (byte)player, 7, 0, 250, (byte)id, (byte)(id >> 8), (byte)id, (byte)(id >> 8) };
-			}
+			return new byte[] { (byte)player, 7, 0, 250, (byte)id, (byte)(id >> 8), (byte)id, (byte)(id >> 8) };
 		}
 
 		private static void AllowAutoShutdown(int i)
@@ -492,13 +550,45 @@ namespace SubworldLibrary
 				return;
 			}
 
-			string name = subworld.FileName;
+			if (preloadedSubservers.Count < 1)
+			{
+				PreloadSubserver();
+			}
+
+			subworld.link = preloadedSubservers.Dequeue();
+
+			copiedData = new TagCompound();
+
+			copiedData["!subworld"] = id;
+			CopyMainWorldData();
+
+			subworld.link.Connect(id, copiedData);
+
+			copiedData = null;
+
+			if (ModContent.GetInstance<Config>().PreloadSubservers && preloadedSubservers.Count < 1)
+			{
+				PreloadSubserver();
+			}
+		}
+
+		/// <summary>
+		/// Preloads an additional subserver. Most mods do not require more than the one preloaded by default, USE CAREFULLY!
+		/// </summary>
+		public static void PreloadSubserver()
+		{
+			if (!Main.dedServ || Program.LaunchParameters.ContainsKey("-subworld"))
+			{
+				return;
+			}
 
 			string args = "tModLoader.dll -server -showserverconsole ";
 
 			args += Main.ActiveWorldFileData.IsCloudSave ? "-cloudworld \"" : "-world \"";
 
-			args += Main.worldPathName + "\" -subworld \"" + name + "\"";
+			args += Main.worldPathName + "\" -subworld \"" + nextLink + "\"";
+
+			args += " -steamworkshopfolder \"" + WorkshopHelper.GetWorkshopFolder(appIDForWorkshop) + "\"";
 
 			if (Program.LaunchParameters.TryGetValue("-modpath", out string modpath))
 			{
@@ -507,10 +597,6 @@ namespace SubworldLibrary
 			if (Program.LaunchParameters.TryGetValue("-modpack", out string modpack))
 			{
 				args += " -modpack \"" + modpack + "\"";
-			}
-			if (Program.LaunchParameters.TryGetValue("-steamworkshopfolder", out string steamworkshopfolder))
-			{
-				args += " -steamworkshopfolder \"" + steamworkshopfolder + "\"";
 			}
 			if (Program.LaunchParameters.TryGetValue("-tmlsavedirectory", out string tmlsavedirectory))
 			{
@@ -533,31 +619,17 @@ namespace SubworldLibrary
 				args += " -secure";
 			}
 
+			SubserverLink link = new SubserverLink(nextLink++);
+
 			Process p = new Process();
 			p.StartInfo.FileName = Process.GetCurrentProcess().MainModule!.FileName;
 			p.StartInfo.Arguments = args;
 			p.StartInfo.UseShellExecute = true;
 			p.EnableRaisingEvents = true;
-			p.Exited += (_, _) => { StopSubserver(id); }; // ensures the main server recognizes a subserver as stopped even if it crashes before the pipes can connect
+			p.Exited += (_, _) => { link.Close(); }; // ensures the main server recognizes a subserver as stopped even if it crashes before the pipes can connect
 			p.Start();
 
-			copiedData = new TagCompound();
-			CopyMainWorldData();
-
-			subworld.link = new SubserverLink(name, copiedData);
-			copiedData = null;
-
-			new Thread(subworld.link.ConnectAndRead)
-			{
-				Name = "Subserver Packets",
-				IsBackground = true
-			}.Start(id);
-
-			new Thread(subworld.link.ConnectAndSend)
-			{
-				Name = "Subserver Relay",
-				IsBackground = true
-			}.Start(id);
+			preloadedSubservers.Enqueue(link);
 		}
 
 		/// <summary>
@@ -566,14 +638,21 @@ namespace SubworldLibrary
 		public static void StopSubserver(int id)
 		{
 			Subworld subworld = subworlds[id];
-			if (subworld.link == null)
+			if (subworld.link == null || subworld.link.Disposed)
 			{
 				return;
 			}
 
-			subworld.link.Close();
+			subworld.link.Dispose();
 			subworld.link = null;
 
+			// prevents trapping tcp clients on a loading screen and sending unnecessary packets when the main server closes
+			if (Netplay.Disconnect)
+			{
+				return;
+			}
+
+			byte[] packet = GetMovePacket(ushort.MaxValue);
 			for (int i = 0; i < 256; i++)
 			{
 				if (playerLocations[i] == id)
@@ -583,9 +662,7 @@ namespace SubworldLibrary
 
 					pendingMoves[i] = ushort.MaxValue;
 
-					ModPacket packet = ModContent.GetInstance<SubworldLibrary>().GetPacket();
-					packet.Write(ushort.MaxValue);
-					packet.Send(i);
+					Netplay.Clients[i].Socket.AsyncSend(packet, 0, packet.Length, NoOp, deniedSockets);
 
 					NetMessage.buffer[i].broadcast = false;
 				}
@@ -1126,60 +1203,62 @@ namespace SubworldLibrary
 
 		private static void LoadIntoSubworld()
 		{
-			playerLocations = null;
-
 			if (Program.LaunchParameters.TryGetValue("-subworld", out string id))
 			{
-				for (int i = 0; i < subworlds.Count; i++)
+				Main.myPlayer = 255;
+				main = Main.ActiveWorldFileData;
+
+				queue = new byte[131070];
+
+				pipeIn = new NamedPipeClientStream(".", "SubserverIN_" + id, PipeDirection.In);
+				pipeIn.Connect();
+
+				// this throws when the main server closes and there's no way to prevent it, yay!
+				try
 				{
-					if (subworlds[i].FileName != id)
-					{
-						continue;
-					}
-
-					Main.myPlayer = 255;
-					main = Main.ActiveWorldFileData;
-					current = subworlds[i];
-
-					queue = new byte[131070];
-
-					pipeIn = new NamedPipeClientStream(".", current.FileName + ".IN", PipeDirection.In);
-					pipeIn.Connect();
-
 					copiedData = TagIO.FromStream(pipeIn);
-					LoadWorld();
-					copiedData = null;
-
-					// replicates Netplay.InitializeServer, no need to set ReadBuffer because it's not used
-					for (int j = 0; j < 256; j++)
-					{
-						RemoteClient client = Netplay.Clients[j];
-						client.Id = j;
-						client.TileSections = new bool[Main.maxTilesX / 200 + 1, Main.maxTilesY / 150 + 1];
-						client.Reset();
-					}
-					SubserverSocket.address = new TcpAddress(IPAddress.Any, 0);
-
-					new Thread(SubserverReadLoop)
-					{
-						IsBackground = true
-					}.Start();
-
-					new Thread(CheckTimeout)
-					{
-						IsBackground = true
-					}.Start();
-
-					pipeOut = new NamedPipeClientStream(".", current.FileName + ".OUT", PipeDirection.Out);
-					pipeOut.Connect();
-
-					new Thread(SubserverSendLoop)
-					{
-						IsBackground = true
-					}.Start();
-
+				}
+				catch
+				{
+					Netplay.Disconnect = true;
+					Main.instance.Exit();
 					return;
 				}
+
+				current = subworlds[copiedData.Get<int>("!subworld")];
+				LoadWorld();
+
+				copiedData = null;
+
+				// replicates Netplay.InitializeServer, no need to set ReadBuffer because it's not used
+				for (int j = 0; j < 256; j++)
+				{
+					RemoteClient client = Netplay.Clients[j];
+					client.Id = j;
+					client.TileSections = new bool[Main.maxTilesX / 200 + 1, Main.maxTilesY / 150 + 1];
+					client.Reset();
+				}
+				SubserverSocket.address = new TcpAddress(IPAddress.Any, 0);
+
+				new Thread(SubserverReadLoop)
+				{
+					IsBackground = true
+				}.Start();
+
+				new Thread(CheckTimeout)
+				{
+					IsBackground = true
+				}.Start();
+
+				pipeOut = new NamedPipeClientStream(".", "SubserverOUT_" + id, PipeDirection.Out);
+				pipeOut.Connect();
+
+				new Thread(SubserverSendLoop)
+				{
+					IsBackground = true
+				}.Start();
+
+				return;
 			}
 
 			Netplay.Disconnect = true;
@@ -1202,6 +1281,7 @@ namespace SubworldLibrary
 							sleep = 0;
 							continue;
 						}
+
 						Thread.Sleep(0);
 						continue;
 					}
@@ -1213,8 +1293,13 @@ namespace SubworldLibrary
 						Buffer.BlockCopy(queue, 0, data, 0, totalData);
 						totalData = 0;
 					}
+
 					pipeOut.Write(data, 0, data.Length);
 				}
+			}
+			catch
+			{
+
 			}
 			finally
 			{
@@ -1286,6 +1371,10 @@ namespace SubworldLibrary
 					}
 				}
 			}
+			catch
+			{
+
+			}
 			finally
 			{
 				Netplay.Disconnect = true;
@@ -1340,10 +1429,6 @@ namespace SubworldLibrary
 			}
 			else
 			{
-				if (index != null)
-				{
-					Netplay.Connection.State = 3;
-				}
 				cache?.OnExit();
 			}
 
@@ -1422,12 +1507,17 @@ namespace SubworldLibrary
 			{
 				LoadWorld();
 			}
-			// the subserver prompts packets from the client first now, so this is no longer needed
-			/*else
+			else
 			{
-				NetMessage.SendData(1);
-				Main.autoPass = true;
-			}*/
+				ModPacket packet = ModContent.GetInstance<SubworldLibrary>().GetPacket();
+				// flip the highest bit (32768) to minimise packet collision, and add 65536 to save a check
+				packet.Write((ushort)(((int)index + 98304) % 65536));
+				packet.Send();
+
+				// the subserver prompts packets from the client first now, so this is no longer needed
+				//NetMessage.SendData(1);
+				//Main.autoPass = true;
+			}
 		}
 
 		private static void LoadWorld()
@@ -1554,6 +1644,8 @@ namespace SubworldLibrary
 
 			WorldGenConfiguration config = current.Config;
 
+			WorldGen.generatingWorld = true;
+
 			for (int i = 0; i < current.Tasks.Count; i++)
 			{
 				WorldGen._genRand = new UnifiedRandom(data.Seed);
@@ -1574,11 +1666,18 @@ namespace SubworldLibrary
 				WorldFile.SaveWorld(cloud);
 			}
 
+			WorldGen.generatingWorld = false;
+
 			SystemLoader.OnWorldLoad();
 		}
 
 		private static void TryLoadWorldFile(string path, bool cloud, int tries)
 		{
+			if (tries > 3)
+			{
+				return;
+			}
+
 			LoadWorldFile(path, cloud);
 			if (WorldGen.loadFailed)
 			{
@@ -1628,7 +1727,7 @@ namespace SubworldLibrary
 
 					return;
 				}
-				TryLoadWorldFile(path, cloud, tries++);
+				TryLoadWorldFile(path, cloud, tries + 1);
 			}
 		}
 
@@ -1727,5 +1826,7 @@ namespace SubworldLibrary
 			}
 			NPC.SetWorldSpecificMonstersByWorldID();
 		}
+
+		internal static void NoOp(object state) { }
 	}
 }

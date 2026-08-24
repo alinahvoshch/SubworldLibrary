@@ -264,7 +264,8 @@ namespace SubworldLibrary
 					void AsyncSend(ILContext il)
 					{
 						var c = new ILCursor(il);
-						if (!c.TryGotoNext(MoveType.After, i => i.MatchRet()))
+						// note that this method's instructions differ on debug builds of tml, this match is stable
+						if (!c.TryGotoNext(i => i.MatchLdsfld(typeof(ModNet), "DetailedLogging")))
 						{
 							Logger.Error("FAILED:");
 							return;
@@ -275,7 +276,7 @@ namespace SubworldLibrary
 						c.Emit(Ldarg_1);
 						c.Emit(Ldarg_2);
 						c.Emit(Ldarg_3);
-						c.Emit(Ldarga, 5);
+						c.Emit(Ldarg, 5);
 						c.Emit(OpCodes.Call, typeof(SubworldLibrary).GetMethod("DenySend", BindingFlags.NonPublic | BindingFlags.Static));
 						var label = c.DefineLabel();
 						c.Emit(Brfalse, label);
@@ -364,6 +365,12 @@ namespace SubworldLibrary
 
 					c.Emit(OpCodes.Call, typeof(SubworldSystem).GetMethod("LoadIntoSubworld", BindingFlags.NonPublic | BindingFlags.Static));
 
+					var label = c.DefineLabel();
+					c.Emit(Ldsfld, current);
+					c.Emit(Brtrue, label);
+					c.Emit(Ret);
+					c.MarkLabel(label);
+
 					c.Emit(Ldarg_0);
 					c.Emit(Newobj, gameTime);
 					c.Emit(Callvirt, update);
@@ -395,7 +402,7 @@ namespace SubworldLibrary
 					c.Emit(OpCodes.Call, typeof(SubworldLibrary).GetMethod("CheckClients", BindingFlags.NonPublic | BindingFlags.Static));
 
 					c.Emit(Ldsfld, typeof(Netplay).GetField("HasClients"));
-					var label = c.DefineLabel();
+					label = c.DefineLabel();
 					c.Emit(Brfalse, label);
 
 					c.Emit(Ldarg_0);
@@ -684,7 +691,7 @@ namespace SubworldLibrary
 			};
 		}
 
-		private static void SendBestiary(byte[] buffer, int start)
+		internal static void SendBestiary(byte[] buffer, int start)
 		{
 			byte type = buffer[start + 5];
 			short id = BitConverter.ToInt16(buffer, start + 6);
@@ -734,7 +741,7 @@ namespace SubworldLibrary
 			}
 		}
 
-		private static void SendText(MessageBuffer buffer, int start, int length)
+		internal static void SendText(MessageBuffer buffer, int start, int length)
 		{
 			// reader position is reset by vanilla
 			buffer.reader.BaseStream.Position = start + 5;
@@ -873,14 +880,8 @@ namespace SubworldLibrary
 			return true;
 		}
 
-		private static bool DenySend(ISocket socket, byte[] data, int start, int length, ref object state)
+		private static bool DenySend(ISocket socket, byte[] data, int start, int length, object state)
 		{
-			// always send sublib packets
-			if (data[start + 2] == 250 && (ModNet.NetModCount < 256 ? data[start + 3] : BitConverter.ToUInt16(data, start + 3)) == ModContent.GetInstance<SubworldLibrary>().NetID)
-			{
-				return false;
-			}
-
 			if (Thread.CurrentThread.Name == "Subserver Packets")
 			{
 				if (data[start + 2] == 82)
@@ -899,7 +900,8 @@ namespace SubworldLibrary
 				return false;
 			}
 
-			return SubworldSystem.deniedSockets.Contains(socket);
+			// if the state matches, this packet has an important "permit" from sublib and should always be sent
+			return SubworldSystem.deniedSockets.Contains(socket) && state != SubworldSystem.deniedSockets;
 		}
 
 		private static void Sleep(Stopwatch stopwatch, double delta, ref double target)
@@ -1001,7 +1003,7 @@ namespace SubworldLibrary
 						SubworldSystem.Exit();
 						return true;
 					case "Current":
-						return SubworldSystem.Current.FullName;
+						return SubworldSystem.Current?.FullName;
 					case "IsActive":
 						return SubworldSystem.IsActive(args[1] as string);
 					case "AnyActive":
@@ -1063,13 +1065,15 @@ namespace SubworldLibrary
 					return;
 				}
 
-				// always read an id in case a request is sent multiple times
 				ushort id = reader.ReadUInt16();
 				if (SubworldSystem.pendingMoves[whoAmI] >= 0)
 				{
-					SubworldSystem.FinishMove(whoAmI);
+					if (SubworldSystem.pendingMoves[whoAmI] == (id + 32768) % 65536)
+					{
+						SubworldSystem.FinishMove(whoAmI);
+					}
 				}
-				else if (!SubworldSystem.noReturn)
+				else if (!SubworldSystem.noReturn && Netplay.Clients[whoAmI].State == 10)
 				{
 					SubworldSystem.MovePlayerToSubserver(whoAmI, id);
 				}
@@ -1078,15 +1082,11 @@ namespace SubworldLibrary
 			{
 				ushort id = reader.ReadUInt16();
 
-				// might be better to set this at the end of the update cycle?
 				SubworldSystem.current = id < ushort.MaxValue ? SubworldSystem.subworlds[id] : null;
 
 				Main.menuMode = 10;
 				Main.gameMenu = true;
-
-				ModPacket packet = GetPacket();
-				packet.Write(id);
-				packet.Send();
+				Netplay.Connection.State = 3;
 
 				Task.Factory.StartNew(SubworldSystem.ExitWorldCallBack, id < ushort.MaxValue ? id : -1);
 			}
